@@ -1,4 +1,6 @@
 import os
+import sys
+import argparse
 import gymnasium as gym
 import numpy as np
 import wandb
@@ -10,8 +12,42 @@ from stable_baselines3.common.vec_env import VecVideoRecorder, VecMonitor
 from stable_baselines3.common.callbacks import EvalCallback, CallbackList
 from wandb.integration.sb3 import WandbCallback
 
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from wandb_utils import wandb_context
 from PPO_hormones import HormonePPOCallback
+
+# # ---------- CLI ----------
+# def parse_args():
+#     parser = argparse.ArgumentParser(description="Run PPO with hormone modulation.")
+#     parser.add_argument(
+#         "--hormones",
+#         type=str,
+#         default="ACD",
+#         help="Hormone combination to enable (choices: NONE, A, C, D, AC, AD, CD, ACD).",
+#     )
+#     parser.add_argument(
+#         "--seed",
+#         type=int,
+#         default=42,
+#         help="Random seed for environment and agent.",
+#     )
+#     return parser.parse_args()
+
+
+# args = parse_args()
+# combo = args.hormones.upper()
+# valid_combos = {"NONE", "A", "C", "D", "AC", "AD", "CD", "ACD"}
+# if combo not in valid_combos:
+#     raise ValueError(f"Invalid hormone selection '{args.hormones}'. Choose from {sorted(valid_combos)}.")
+
+# use_A = "A" in combo
+# use_C = "C" in combo
+# use_D = "D" in combo
+# if combo == "NONE":
+#     use_A = use_C = use_D = False
+
+# combo_suffix = combo.lower()
 
 # ---------- Config ----------
 PROJECT = "hormonal-rl"
@@ -69,7 +105,8 @@ wandb_run = wandb.init(
         "homeo_A": 0.05, "homeo_C": 0.04, "homeo_D": 0.03,
         "ent0": 0.01, "lr0": 3e-4, "clip0": 0.2,
         "clamp_ent": (1e-4, 0.2), "clamp_lr": (2e-4, 3e-4), "clamp_clip": (0.18, 0.3),
-        "use_A": True, "use_C": True, "use_D": True,
+        # "use_A": use_A, "use_C": use_C, "use_D": use_D,
+        # "hormone_combo": combo,
     },
     save_code=True,
     sync_tensorboard=True,
@@ -122,6 +159,7 @@ horm_cb = HormonePPOCallback(
     homeo_A=wandb.config.homeo_A, homeo_C=wandb.config.homeo_C, homeo_D=wandb.config.homeo_D,
     ent0=wandb.config.ent0, lr0=wandb.config.lr0, clip0=wandb.config.clip0,
     clamp_ent=wandb.config.clamp_ent, clamp_lr=wandb.config.clamp_lr, clamp_clip=wandb.config.clamp_clip,
+    # use_A=wandb.config.use_A, use_C=wandb.config.use_C, use_D=wandb.config.use_D,
     verbose=0,
 )
 
@@ -144,17 +182,26 @@ artifact.add_file(final_path)
 wandb.log_artifact(artifact)
 
 # ---------- Final eval summary ----------
+# Create a fresh non-vectorized env for final evaluation
+# (eval_env may have been modified by EvalCallback)
+final_env = gym.make(ENV_ID)
+final_env = gym.wrappers.RecordEpisodeStatistics(final_env)
+
 returns, lengths = [], []
-for _ in range(N_EVAL_EPISODES):
-    obs, info = eval_env.reset()
+for i in range(N_EVAL_EPISODES):
+    obs, info = final_env.reset(seed=SEED + 1 + i)
     done = False
     ep_ret, ep_len = 0.0, 0
     while not done:
         action, _ = model.predict(obs, deterministic=True)
-        obs, reward, terminated, truncated, info = eval_env.step(action)
+        # Ensure action is a scalar (not 0-dimensional array)
+        action = int(action) if isinstance(action, (np.ndarray, np.generic)) else action
+        obs, reward, terminated, truncated, info = final_env.step(action)
         ep_ret += float(reward); ep_len += 1
         done = terminated or truncated
     returns.append(ep_ret); lengths.append(ep_len)
+
+final_env.close()
 
 wandb.log({
     "final_eval/mean_return": float(np.mean(returns)),
