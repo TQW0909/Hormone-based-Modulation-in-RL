@@ -1,4 +1,5 @@
 import os
+import sys
 import gymnasium as gym
 import numpy as np
 import wandb
@@ -10,11 +11,13 @@ from stable_baselines3.common.vec_env import VecVideoRecorder, VecMonitor
 from stable_baselines3.common.callbacks import EvalCallback, CallbackList
 from wandb.integration.sb3 import WandbCallback
 
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from wandb_utils import wandb_context
 
 # ---------- Config ----------
 PROJECT = "hormonal-rl"   
-ENV_ID  = "CartPole-v1"
+ENV_ID  = "LunarLander-v3" # "CartPole-v1"  "LunarLander-v3"
 ALGO    = "PPO"           
 VARIANT = "baseline"      
 SEED    = 42
@@ -22,26 +25,45 @@ TOTAL_TIMESTEPS = 250_000
 EVAL_FREQ = 10_000
 N_EVAL_EPISODES = 10
 
-ppo_kwargs = dict(
-    learning_rate=3e-4,     # LR
-    gamma=0.99,             # γ
-    gae_lambda=0.95,        # λ (GAE)
-    clip_range=0.2,         # ε
-    ent_coef=0.01,          # entropy coef (note: >0 vs your previous 0.0)
-    n_epochs=10,            # epochs per update
-    # IMPORTANT: In SB3, batch_size is the *minibatch* size.
-    # We'll make it equal to the full rollout (i.e., full-batch updates).
-    # With n_envs=1, set n_steps=2048 so total rollout = 2048.
-    n_steps=2048,
-    batch_size=2048,        # must divide (n_steps * n_envs); here it equals it
-    policy_kwargs=dict(
-        net_arch=dict(pi=[64, 64], vf=[64, 64]),  # or swap to [128, 128]
-        activation_fn=torch.nn.Tanh,              # tanh
+hyperparameters = {
+    "CartPole-v1": dict(
+        learning_rate=3e-4,     # LR
+        n_steps=2048,
+        batch_size=2048,        # must divide (n_steps * n_envs); here it equals it
+        n_epochs=10,            # epochs per update
+        gamma=0.99,             # γ
+        gae_lambda=0.95,        # λ (GAE)
+        clip_range=0.2,         # ε
+        ent_coef=0.01,          # entropy coef (note: >0 vs your previous 0.0)
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        target_kl=None,         # e.g., set 0.03 if you want gentle early stopping
+        policy_kwargs=dict(
+            net_arch=dict(pi=[64, 64], vf=[64, 64]),  # or swap to [128, 128]
+            activation_fn=torch.nn.Tanh,              # tanh
+        )
     ),
-    max_grad_norm=0.5,
-    vf_coef=0.5,
-    target_kl=None,         # e.g., set 0.03 if you want gentle early stopping
-)
+    "LunarLander-v3": dict (
+        learning_rate=3e-4,
+        n_steps=1024,
+        batch_size=64,
+        n_epochs=4,
+        gamma=0.999,           # Key for LunarLander
+        gae_lambda=0.98,
+        clip_range=0.2,
+        ent_coef=0.01,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        target_kl=None,
+        policy_kwargs=dict(
+            net_arch=dict(pi=[256, 256], vf=[256, 256]),
+            activation_fn=torch.nn.ReLU,
+        )
+    )
+}
+
+
+ppo_kwargs = hyperparameters[ENV_ID]
 
 # ---------- W&B init ----------
 try:
@@ -71,9 +93,10 @@ vec_env = make_vec_env(ENV_ID, n_envs=1, seed=SEED)
 vec_env = VecMonitor(vec_env)
 
 # ---------- Evaluation env (non-vector for clean eval) ----------
-eval_env = gym.make(ENV_ID)
-eval_env = gym.wrappers.RecordEpisodeStatistics(eval_env) 
-eval_env.reset(seed=SEED + 1)
+# eval_env = gym.make(ENV_ID)
+# eval_env = gym.wrappers.RecordEpisodeStatistics(eval_env) 
+# eval_env.reset(seed=SEED + 1)
+eval_env = VecMonitor(make_vec_env(ENV_ID, n_envs=1, seed=SEED+1))
 
 # ---------- Model ----------
 model = PPO(
@@ -127,15 +150,20 @@ wandb.log_artifact(artifact)
 
 # ---------- Final evaluation summary (table + scalars) ----------
 # Run a clean eval to log a summary to W&B
+final_env = gym.make(ENV_ID)
+final_env = gym.wrappers.RecordEpisodeStatistics(final_env)
+
 returns = []
 lengths = []
-for _ in range(N_EVAL_EPISODES):
-    obs, info = eval_env.reset()
+for i in range(N_EVAL_EPISODES):
+    obs, info = final_env.reset(seed=SEED + 1 + i)
     done = False
     ep_ret, ep_len = 0.0, 0
     while not done:
         action, _ = model.predict(obs, deterministic=True)
-        obs, reward, terminated, truncated, info = eval_env.step(action)
+        # Ensure action is a scalar (not 0-dimensional array)
+        action = int(action) if isinstance(action, (np.ndarray, np.generic)) else action
+        obs, reward, terminated, truncated, info = final_env.step(action)
         ep_ret += float(reward)
         ep_len += 1
         done = terminated or truncated
@@ -157,5 +185,5 @@ wandb.log({
     )
 })
 
-eval_env.close()
+final_env.close()
 wandb.finish()
