@@ -835,13 +835,11 @@ class HormonePPOCallback(BaseCallback):
             td_bonus = max(0, 1.0 - normalized['td_hat']) * 0.3
             signal_D = signal_D + td_bonus
             
-            # Always have small baseline pulse to maintain some dopamine
-            baseline_pulse = 0.01 if self.rollout_idx > self.warmup_rollouts else 0.0
             
             if self.refrac['D'] == 0 and signal_D > self.th['D']:
-                pulses['D'] = self.k['D'] * signal_D + baseline_pulse
+                pulses['D'] = self.k['D'] * signal_D 
             else:
-                pulses['D'] = baseline_pulse
+                pulses['D'] = 0.0
         else:
             pulses['D'] = 0.0
             
@@ -1198,8 +1196,8 @@ if __name__ == "__main__":
         T12_D=15.0,  # 15 rollouts = ~60k steps
         # Longer half-life = D changes persist longer
         
-        # Pulse gain: How much D increases when triggered
-        k_D=0.08,  # Conservative (was 0.10-0.20 in your tests)
+        # Pulse gain: How much D increases when triggeresd
+        k_D=0.10,  # Conservative (was 0.10-0.20 in your tests)
         # Smaller gain = gentler changes
         
         # Threshold: When to trigger D pulse
