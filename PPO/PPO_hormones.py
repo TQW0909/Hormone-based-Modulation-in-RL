@@ -767,16 +767,22 @@ class HormonePPOCallback(BaseCallback):
                 setattr(self, hormone, getattr(self, f'base_{hormone}'))
                 
         # Apply advanced coupling if enabled (only affects enabled hormones)
+        # NOTE: Only apply coupling when multiple hormones are enabled
+        # When only one hormone is enabled, coupling causes unwanted habituation
+        # through receptor sensitivity adaptation
         if self.hormone_coupler:
-            # Calculate external stress from KL divergence if available
-            external_stress = 0.0
-            if self.target_kl and self._last_approx_kl:
-                kl_ratio = self._last_approx_kl / (self.target_kl + 1e-8)
-                if kl_ratio > 2.0:
-                    external_stress = min(0.3, 0.1 * (kl_ratio - 2.0))
+            # Count how many hormones are enabled
+            num_enabled = sum([self.use_A, self.use_C, self.use_D])
             
-            # Only apply coupling if at least one hormone is enabled
-            if self.use_A or self.use_C or self.use_D:
+            # Only apply coupling if multiple hormones are enabled
+            if num_enabled > 1:
+                # Calculate external stress from KL divergence if available
+                external_stress = 0.0
+                if self.target_kl and self._last_approx_kl:
+                    kl_ratio = self._last_approx_kl / (self.target_kl + 1e-8)
+                    if kl_ratio > 2.0:
+                        external_stress = min(0.3, 0.1 * (kl_ratio - 2.0))
+                
                 # Use enabled hormones for coupling, disabled ones use 0.0 (no coupling effect)
                 # This prevents disabled hormones from affecting enabled ones through coupling
                 A_for_coupling = self.A if self.use_A else 0.0
@@ -803,9 +809,22 @@ class HormonePPOCallback(BaseCallback):
         if self.use_A:
             # Signal combines novelty and advantage magnitude
             signal_A = normalized['adv_hat'] * normalized['nov_hat']
+            
+            # Apply adaptive threshold: lower threshold when A is low to encourage exploration
+            # This ensures pulses can still occur later in training when novelty is lower
+            adaptive_threshold = self.th['A']
+            if self.A < 0.6:  # When A is below baseline, lower threshold to encourage pulses
+                adaptive_threshold = self.th['A'] * 0.7  # 30% lower threshold
+            
             # Pulse if signal exceeds threshold and not in refractory
-            if self.refrac['A'] == 0 and signal_A > (1.0 + self.th['A']):
-                pulses['A'] = self.k['A'] * (signal_A - 1.0)
+            if self.refrac['A'] == 0 and signal_A > (1.0 + adaptive_threshold):
+                # Calculate base pulse
+                base_pulse = self.k['A'] * (signal_A - 1.0)
+                # Scale down pulse when A is already high (saturation effect)
+                # This prevents hitting ceiling and allows natural decay
+                # When A is at 1.0, pulse is 0; when A is at 0.5, pulse is full strength
+                saturation_factor = max(0.0, 1.0 - 2.0 * (self.A - 0.5))
+                pulses['A'] = base_pulse * saturation_factor
             else:
                 pulses['A'] = 0.0
         else:
@@ -988,13 +1007,15 @@ def schedule_value(schedule, progress: float) -> float:
     return float(schedule)
 
 
+
+
 if __name__ == "__main__":
 
     # ---------- Config ----------
     PROJECT = "hormonal-rl"
     ENV_ID  = "LunarLander-v3"     # "CartPole-v1"  "LunarLander-v3"
     ALGO    = "PPO"
-    VARIANT = "hormones:D_only"
+    VARIANT = "hormones:A_only"
     SEED    = 42
     TOTAL_TIMESTEPS = 250_000
     EVAL_FREQ = 10_000
@@ -1171,9 +1192,9 @@ if __name__ == "__main__":
         # DOPAMINE ONLY - Conservative Settings
         # ========================================
         
-        use_A=False, 
+        use_A=True, 
         use_C=False, 
-        use_D=True,  # Only test Dopamine
+        use_D=False,  # Only test Dopamine
         
         # Base hormone levels
         base_A=0.5, 
@@ -1203,6 +1224,19 @@ if __name__ == "__main__":
         # Threshold: When to trigger D pulse
         th_D=0.20,  # Moderate (progress signal > 1.20 baseline)
         # Higher threshold = pulses less often (more selective)
+
+        # Half-life: How fast A decays back to baseline
+        T12_A=12.0,  # 12 rollouts = ~48k steps
+        # Shorter than D (15.0) because novelty/exploration needs are more transient
+        
+        # Pulse gain: How much A increases when triggered
+        k_A=0.10,  # Conservative start (similar to your working D gain)
+        # Will pulse when novelty × advantage is high
+        
+        # Threshold: When to trigger A pulse
+        th_A=0.30,  # Fairly high (0.20 for D, 0.30 for A)
+        # Higher because novelty signal can be noisy
+        # Triggers when (novelty × advantage) > 1.30 baseline
         
         # Refractory period: Cooldown after pulse
         # (using default from __init__: refrac_len['D'] = 1 rollout)
@@ -1215,10 +1249,14 @@ if __name__ == "__main__":
         clamp_lr=(2.7e-4, 3.3e-4),  # ±10% around baseline (3e-4)
         # When D high (progress) → LR increases (faster learning)
         # When D low (plateau) → LR decreases (more stable)
+
+        # Adrenaline modulates ENTROPY only (exploration)
+        clamp_ent=(0.008, 0.012),   # ±20% around baseline (0.01)
+        # When A high (novelty) → entropy increases (more exploration)
+        # When A low (familiar) → entropy decreases (more exploitation)
         
-        # Keep these FIXED (D doesn't affect them)
-        clamp_ent=(0.01, 0.01),     # Entropy fixed
-        clamp_clip=(0.2, 0.2),      # Clip fixed
+        # Keep these FIXED (A doesn't affect them)
+        clamp_clip=(0.2, 0.2),      # Clip range fixed
         
         verbose=1  # Print diagnostics
     )
