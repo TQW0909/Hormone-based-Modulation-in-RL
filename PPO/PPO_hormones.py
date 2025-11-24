@@ -433,9 +433,9 @@ class HormonePPOCallback(BaseCallback):
         lr0: float = 3e-4,
         clip0: float = 0.2,
         # Clamping ranges
-        clamp_ent: Tuple[float, float] = (0.005, 0.015),
-        clamp_lr: Tuple[float, float] = (2.5e-4, 3.5e-4),
-        clamp_clip: Tuple[float, float] = (0.19, 0.21),
+        clamp_ent: Tuple[float, float] = (0.008, 0.012), # (0.005, 0.015) for CartPole, (0.001, 0.005) for LunarLander
+        clamp_lr: Tuple[float, float] = (2.8e-4, 3.2e-4), # (2.5e-4, 3.5e-4) for CartPole, (2.8e-4, 3.2e-4) for LunarLander
+        clamp_clip: Tuple[float, float] = (0.195, 0.205), # (0.18, 0.3) for CartPole, (0.195, 0.205) for LunarLander
         # Feature flags
         use_A: bool = True,
         use_C: bool = True,
@@ -446,11 +446,11 @@ class HormonePPOCallback(BaseCallback):
         T12_D: float = 6.0,  # Dopamine half-life
         k_A: float = 0.15,   # Adrenaline pulse gain
         k_C: float = 0.10,   # Cortisol pulse gain
-        k_D: float = 0.20,   # Dopamine pulse gain
+        k_D: float = 0.10,   # Dopamine pulse gain (0.20 for CartPole, 0.10 for LunarLander)
         # Thresholds for hormone activation
         th_A: float = 0.20,  # Adrenaline threshold (above baseline)
         th_C: float = 0.30,  # Cortisol threshold
-        th_D: float = 0.10,  # Dopamine threshold
+        th_D: float = 0.20,  # Dopamine threshold (0.10 for CartPole, 0.20 for LunarLander)
     ):
         super().__init__(verbose)
 
@@ -519,7 +519,7 @@ class HormonePPOCallback(BaseCallback):
 
         # Signal smoothing
         self.signal_history = {}
-        self.signal_smooth_alpha = 0.3  # Lower = more smoothing
+        self.signal_smooth_alpha = 0.5  # Lower = more smoothing (0.3 for CartPole, 0.5 for LunarLander)
         
         # Hormone momentum
         self.hormone_momentum = 0.7  # Higher = more inertia
@@ -736,31 +736,37 @@ class HormonePPOCallback(BaseCallback):
         pulses = self._calculate_pulses(normalized)
         self._last_pulses = pulses
         
-        # Apply decay toward homeostatic centers and add pulses
+        # Apply decay toward homeostatic centers and add pulses (only for enabled hormones)
         for hormone in ['A', 'C', 'D']:
-            # Get current level and homeostatic center
-            current = getattr(self, hormone)
-            center = getattr(self, f'H0_{hormone}')
+            use_flag = getattr(self, f'use_{hormone}')
             
-            # Apply exponential decay toward center
-            new_level = center + (current - center) * (1.0 - self.lam[hormone])
-            
-            # Add pulse
-            new_level += pulses[hormone]
-            
-            # Clamp to [0, 1]
-            new_level = np.clip(new_level, 0.0, 1.0)
-            
-            # Update level
-            setattr(self, hormone, new_level)
-            
-            # Update refractory period if pulse was large
-            if pulses[hormone] > 0.15:
-                self.refrac[hormone] = self.refrac_len[hormone]
-            else:
-                self.refrac[hormone] = max(0, self.refrac[hormone] - 1)
+            if use_flag:
+                # Get current level and homeostatic center
+                current = getattr(self, hormone)
+                center = getattr(self, f'H0_{hormone}')
                 
-        # Apply advanced coupling if enabled
+                # Apply exponential decay toward center
+                new_level = center + (current - center) * (1.0 - self.lam[hormone])
+                
+                # Add pulse
+                new_level += pulses[hormone]
+                
+                # Clamp to [0, 1]
+                new_level = np.clip(new_level, 0.0, 1.0)
+                
+                # Update level
+                setattr(self, hormone, new_level)
+                
+                # Update refractory period if pulse was large
+                if pulses[hormone] > 0.15:
+                    self.refrac[hormone] = self.refrac_len[hormone]
+                else:
+                    self.refrac[hormone] = max(0, self.refrac[hormone] - 1)
+            else:
+                # Disabled hormone: maintain baseline value
+                setattr(self, hormone, getattr(self, f'base_{hormone}'))
+                
+        # Apply advanced coupling if enabled (only affects enabled hormones)
         if self.hormone_coupler:
             # Calculate external stress from KL divergence if available
             external_stress = 0.0
@@ -768,10 +774,26 @@ class HormonePPOCallback(BaseCallback):
                 kl_ratio = self._last_approx_kl / (self.target_kl + 1e-8)
                 if kl_ratio > 2.0:
                     external_stress = min(0.3, 0.1 * (kl_ratio - 2.0))
-                    
-            self.A, self.C, self.D = self.hormone_coupler.couple_hormones(
-                self.A, self.C, self.D, external_stress
-            )
+            
+            # Only apply coupling if at least one hormone is enabled
+            if self.use_A or self.use_C or self.use_D:
+                # Use enabled hormones for coupling, disabled ones use 0.0 (no coupling effect)
+                # This prevents disabled hormones from affecting enabled ones through coupling
+                A_for_coupling = self.A if self.use_A else 0.0
+                C_for_coupling = self.C if self.use_C else 0.0
+                D_for_coupling = self.D if self.use_D else 0.0
+                
+                A_coupled, C_coupled, D_coupled = self.hormone_coupler.couple_hormones(
+                    A_for_coupling, C_for_coupling, D_for_coupling, external_stress
+                )
+                
+                # Only update enabled hormones with coupling results
+                if self.use_A:
+                    self.A = A_coupled
+                if self.use_C:
+                    self.C = C_coupled
+                if self.use_D:
+                    self.D = D_coupled
             
     def _calculate_pulses(self, normalized: Dict[str, float]) -> Dict[str, float]:
         """Calculate hormone pulses from normalized signals."""
@@ -797,7 +819,9 @@ class HormonePPOCallback(BaseCallback):
             if self.refrac['C'] == 0 and signal_C > (1.0 + self.th['C']):
                 pulses['C'] = self.k['C'] * (signal_C - 1.0)
                 # Reduce pulse if dopamine is high (confidence reduces stress)
-                pulses['C'] *= (1.0 - 0.3 * self.D)
+                # Only use dopamine effect if dopamine is enabled
+                if self.use_D:
+                    pulses['C'] *= (1.0 - 0.3 * self.D)
             else:
                 pulses['C'] = 0.0
         else:
@@ -830,23 +854,28 @@ class HormonePPOCallback(BaseCallback):
             return
             
         # Get effective hormone levels (could be post-coupling)
+        # Use baseline values for disabled hormones to ensure no modulation effect
         A_eff = self.A if self.use_A else self.base_A
         C_eff = self.C if self.use_C else self.base_C
         D_eff = self.D if self.use_D else self.base_D
         
         # Calculate hyperparameters with improved mapping
+        # All formulas are centered around baseline (0.5) so that baseline values
+        # produce multipliers of exactly 1.0 (no modulation)
         
         # Entropy: exploration (A) increases, exploitation (D) decreases
-        # Map from centered hormones (-0.5 to 0.5) to multiplier
+        # Map from centered hormones (deviation from 0.5) to multiplier
         ent_multiplier = 1.0 + 0.2 * (A_eff - 0.5) - 0.15 * (D_eff - 0.5)
         ent = self.ent0 * ent_multiplier
         
         # Learning rate: caution (C) decreases, confidence (D) increases
-        lr_multiplier = 1.0 - 0.1 * C_eff + 0.08 * D_eff
+        # Centered around 0.5: when C=0.5 and D=0.5, multiplier = 1.0
+        lr_multiplier = 1.0 - 0.1 * (C_eff - 0.5) + 0.08 * (D_eff - 0.5)
         lr = self.lr0 * lr_multiplier
         
         # Clip range: stability (C) tightens, exploration (A) loosens
-        clip_multiplier = 1.0 - 0.04 * C_eff + 0.025 * A_eff
+        # Centered around 0.5: when C=0.5 and A=0.5, multiplier = 1.0
+        clip_multiplier = 1.0 - 0.04 * (C_eff - 0.5) + 0.025 * (A_eff - 0.5)
         clip = self.clip0 * clip_multiplier
         
         # Apply KL-aware scaling if available
@@ -965,9 +994,9 @@ if __name__ == "__main__":
 
     # ---------- Config ----------
     PROJECT = "hormonal-rl"
-    ENV_ID  = "CartPole-v1"     # "CartPole-v1"  "LunarLander-v3"
+    ENV_ID  = "LunarLander-v3"     # "CartPole-v1"  "LunarLander-v3"
     ALGO    = "PPO"
-    VARIANT = "hormones"
+    VARIANT = "hormones:D_only"
     SEED    = 42
     TOTAL_TIMESTEPS = 250_000
     EVAL_FREQ = 10_000
@@ -1035,7 +1064,7 @@ if __name__ == "__main__":
             "total_timesteps": TOTAL_TIMESTEPS,
             
             # Core hormone parameters
-            "warmup_rollouts": 5,
+            "warmup_rollouts": 15,  # 5 for CartPole, 15 for LunarLander
             "base_A": 0.5, "base_C": 0.5, "base_D": 0.5,
             
             # Pulse-decay dynamics
@@ -1056,7 +1085,7 @@ if __name__ == "__main__":
             "clamp_clip": (0.18, 0.3),
             
             # Feature flags for ablation studies
-            "use_A": True, "use_C": True, "use_D": True,
+            "use_A": False, "use_C": False, "use_D": True,
         },
         save_code=True,
         sync_tensorboard=True,
@@ -1103,15 +1132,97 @@ if __name__ == "__main__":
         verbose=2,
     )
 
+    # horm_cb = HormonePPOCallback(
+    #     warmup_rollouts=15,  # 5 for CartPole, 10 for LunarLander
+    #     base_A=0.5,
+    #     base_C=0.5,
+    #     base_D=0.5,
+    #     ent0=0.01,
+    #     lr0=3e-4,
+    #     clip0=0.2,
+    #     verbose=1
+    # )
+
+    # horm_cb = HormonePPOCallback(
+    #     warmup_rollouts=25,  # Let it learn baseline behavior first
+        
+    #     # Very long half-lives (slow changes)
+    #     T12_A=15.0, T12_C=25.0, T12_D=20.0,
+        
+    #     # Minimal gains
+    #     k_A=0.05, k_C=0.03, k_D=0.05,
+        
+    #     # High thresholds
+    #     th_A=0.40, th_C=0.50, th_D=0.30,
+        
+    #     # Extremely tight clamps (almost fixed)
+    #     clamp_ent=(0.0095, 0.0105),  # 0.01 ± 5%
+    #     clamp_lr=(2.85e-4, 3.15e-4),  # 3e-4 ± 5%
+    #     clamp_clip=(0.19, 0.21),
+        
+    #     base_A=0.5, base_C=0.5, base_D=0.5,
+    #     ent0=0.01, lr0=3e-4, clip0=0.2,
+
+    #     # Feature flags for ablation studies
+    #     use_A=False, use_C=False, use_D=False,
+    #     verbose=1
+    # )
+
     horm_cb = HormonePPOCallback(
-        warmup_rollouts=5,
-        base_A=0.5,
-        base_C=0.5,
+        # ========================================
+        # DOPAMINE ONLY - Conservative Settings
+        # ========================================
+        
+        use_A=False, 
+        use_C=False, 
+        use_D=True,  # Only test Dopamine
+        
+        # Base hormone levels
+        base_A=0.5, 
+        base_C=0.5, 
         base_D=0.5,
-        ent0=0.01,
-        lr0=3e-4,
+        
+        # Initial hyperparameters
+        ent0=0.01, 
+        lr0=3e-4, 
         clip0=0.2,
-        verbose=1
+        
+        # ========================================
+        # DOPAMINE PARAMETERS
+        # ========================================
+        
+        # Warmup: Calibrate signals before modulating
+        warmup_rollouts=20,  # ~80k steps to establish baseline
+        
+        # Half-life: How fast D decays back to baseline
+        T12_D=15.0,  # 15 rollouts = ~60k steps
+        # Longer half-life = D changes persist longer
+        
+        # Pulse gain: How much D increases when triggered
+        k_D=0.08,  # Conservative (was 0.10-0.20 in your tests)
+        # Smaller gain = gentler changes
+        
+        # Threshold: When to trigger D pulse
+        th_D=0.20,  # Moderate (progress signal > 1.20 baseline)
+        # Higher threshold = pulses less often (more selective)
+        
+        # Refractory period: Cooldown after pulse
+        # (using default from __init__: refrac_len['D'] = 1 rollout)
+        
+        # ========================================
+        # HYPERPARAMETER CLAMPING
+        # ========================================
+        
+        # Dopamine modulates LEARNING RATE only
+        clamp_lr=(2.7e-4, 3.3e-4),  # ±10% around baseline (3e-4)
+        # When D high (progress) → LR increases (faster learning)
+        # When D low (plateau) → LR decreases (more stable)
+        
+        # Keep these FIXED (D doesn't affect them)
+        clamp_ent=(0.01, 0.01),     # Entropy fixed
+        clamp_clip=(0.2, 0.2),      # Clip fixed
+        
+        verbose=1  # Print diagnostics
     )
 
     callbacks = CallbackList([eval_cb, wandb_cb, horm_cb])
