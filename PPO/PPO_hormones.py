@@ -481,7 +481,7 @@ class HormonePPOCallback(BaseCallback):
 
        # Initialize improved components
         self.novelty_detector = None  # Will be initialized when we know obs_dim
-        self.hormone_coupler = AdvancedHormoneCoupler()
+        self.hormone_coupler = None     # AdvancedHormoneCoupler()
         self.progress_tracker = MultiScaleProgressTracker()
         
         # Pulse-decay dynamics
@@ -573,6 +573,18 @@ class HormonePPOCallback(BaseCallback):
 
     def _on_rollout_end(self) -> None:
         """Process rollout data and update hormones."""
+
+        # ADD: Emergency reset for catastrophic failures
+        if self.use_C and len(self._last_episode_rewards) > 0:
+            recent_reward = np.mean(self._last_episode_rewards)
+            if recent_reward < -50 and self.C > 0.6:
+                if self.verbose:
+                    print(f"🚨 EMERGENCY RESET: Reward={recent_reward:.1f}, C={self.C:.3f}")
+                    print(f"   Resetting C to baseline and restoring LR")
+                self.C = 0.5
+                self.refrac['C'] = 10
+                for param_group in self.model.policy.optimizer.param_groups:
+                    param_group['lr'] = self.lr0
         
         # Collect signals from rollout
         signals = self._collect_signals()
@@ -684,6 +696,7 @@ class HormonePPOCallback(BaseCallback):
             self.ema_td = alpha * signals['td_error'] + (1 - alpha) * self.ema_td
             self.ema_vol = alpha * signals['td_mad'] + (1 - alpha) * self.ema_vol
             
+
         # Set references after warmup
         if self.ref_adv is None:
             self.ref_adv = self.ema_adv
@@ -832,20 +845,43 @@ class HormonePPOCallback(BaseCallback):
             
         # Cortisol pulse: volatility/uncertainty (stress response)
         if self.use_C:
-            # Signal is volatility (TD MAD)
             signal_C = normalized['vol_hat']
-            # Pulse if high volatility and not in refractory
-            if self.refrac['C'] == 0 and signal_C > (1.0 + self.th['C']):
-                pulses['C'] = self.k['C'] * (signal_C - 1.0)
+            
+            # ADD: Track recent C pulses for cascade detection
+            if not hasattr(self, 'recent_c_pulses'):
+                self.recent_c_pulses = deque(maxlen=20)
+            
+            # Count pulses in last 20 rollouts
+            pulse_density = sum(1 for p in self.recent_c_pulses if p > 0.01)
+            
+            # ADD: If pulsing too frequently, raise threshold
+            adaptive_threshold = self.th['C']
+            if pulse_density >= 3:  # More than 3 pulses in 20 rollouts = cascade
+                adaptive_threshold = self.th['C'] + 0.3  # Temporarily raise threshold
+                if self.verbose and self.rollout_idx % 5 == 0:
+                    print(f"⚠️ C cascade detected! Raising threshold to {adaptive_threshold:.2f}")
+            
+            # Normal pulse logic with adaptive threshold
+            if self.refrac['C'] == 0 and signal_C > (1.0 + adaptive_threshold):
+                base_pulse = self.k['C'] * (signal_C - 1.0)
+                
                 # Reduce pulse if dopamine is high (confidence reduces stress)
-                # Only use dopamine effect if dopamine is enabled
                 if self.use_D:
-                    pulses['C'] *= (1.0 - 0.3 * self.D)
+                    base_pulse *= (1.0 - 0.3 * self.D)
+                
+                # ADD: Apply saturation to prevent hitting ceiling
+                # When C is already high, reduce pulse strength
+                saturation_factor = max(0.3, 1.0 - (self.C - 0.5) * 1.5)
+                pulses['C'] = base_pulse * saturation_factor
+                
+                self.recent_c_pulses.append(pulses['C'])
             else:
                 pulses['C'] = 0.0
+                self.recent_c_pulses.append(0.0)
         else:
             pulses['C'] = 0.0
-            
+
+
         # Dopamine pulse: progress signal (reward/improvement)
         if self.use_D:
             # Main signal is progress (combines multiple metrics)
@@ -906,6 +942,13 @@ class HormonePPOCallback(BaseCallback):
         # Apply safety clamping
         ent = np.clip(ent, self.clamp_ent[0], self.clamp_ent[1])
         lr = np.clip(lr, self.clamp_lr[0], self.clamp_lr[1])
+
+        absolute_lr_floor = 2.5e-4
+        if lr < absolute_lr_floor:
+            lr = absolute_lr_floor
+            if self.verbose and self.rollout_idx % 10 == 0:
+                print(f"⚠️ LR at safety floor! C={self.C:.3f}")
+
         clip = np.clip(clip, self.clamp_clip[0], self.clamp_clip[1])
         
         # Ensure minimum entropy to prevent collapse
@@ -1015,7 +1058,7 @@ if __name__ == "__main__":
     PROJECT = "hormonal-rl"
     ENV_ID  = "LunarLander-v3"     # "CartPole-v1"  "LunarLander-v3"
     ALGO    = "PPO"
-    VARIANT = "hormones:A_only"
+    VARIANT = "hormones:C_only"
     SEED    = 42
     TOTAL_TIMESTEPS = 250_000
     EVAL_FREQ = 10_000
@@ -1192,8 +1235,8 @@ if __name__ == "__main__":
         # DOPAMINE ONLY - Conservative Settings
         # ========================================
         
-        use_A=True, 
-        use_C=False, 
+        use_A=False, 
+        use_C=True, 
         use_D=False,  # Only test Dopamine
         
         # Base hormone levels
@@ -1237,6 +1280,19 @@ if __name__ == "__main__":
         th_A=0.30,  # Fairly high (0.20 for D, 0.30 for A)
         # Higher because novelty signal can be noisy
         # Triggers when (novelty × advantage) > 1.30 baseline
+
+        # Half-life: How fast C decays back to baseline
+        T12_C=8.0,  # 20 rollouts = ~80k steps
+        # Longer than A (12.0) and D (15.0) because stress persists longer
+        
+        # Pulse gain: How much C increases when triggered
+        k_C=0.08,  # Conservative (similar to working D gain)
+        # Will pulse when volatility (TD error variance) is high
+        
+        # Threshold: When to trigger C pulse
+        th_C=0.40,  # High threshold (0.20 for D, 0.30 for A, 0.40 for C)
+        # Higher because volatility signal is very noisy in LunarLander
+        # Triggers when volatility > 1.40× baseline
         
         # Refractory period: Cooldown after pulse
         # (using default from __init__: refrac_len['D'] = 1 rollout)
@@ -1255,8 +1311,10 @@ if __name__ == "__main__":
         # When A high (novelty) → entropy increases (more exploration)
         # When A low (familiar) → entropy decreases (more exploitation)
         
-        # Keep these FIXED (A doesn't affect them)
-        clamp_clip=(0.2, 0.2),      # Clip range fixed
+        # Cortisol modulates BOTH learning rate AND clip range (caution)
+        clamp_clip=(0.19, 0.21),     # ±5% around baseline (0.2)
+        # When C high (stress) → clip tightens (smaller policy updates)
+        # When C low (calm) → clip loosens (larger policy updates)
         
         verbose=1  # Print diagnostics
     )
