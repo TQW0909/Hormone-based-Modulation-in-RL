@@ -17,7 +17,7 @@ from wandb_utils import wandb_context
 
 # ---------- Config ----------
 PROJECT = "hormonal-rl"   
-ENV_ID  = "LunarLander-v3" # "CartPole-v1"  "LunarLander-v3"
+ENV_ID  = "LunarLander-v3" # "CartPole-v1"  "LunarLander-v3" "Ant-v4"
 ALGO    = "PPO"           
 VARIANT = "baseline"      
 SEED    = 42
@@ -55,6 +55,23 @@ hyperparameters = {
         vf_coef=0.5,
         max_grad_norm=0.5,
         target_kl=None,
+        policy_kwargs=dict(
+            net_arch=dict(pi=[256, 256], vf=[256, 256]),
+            activation_fn=torch.nn.ReLU,
+        )
+    ),
+    "Ant-v4": dict(
+        learning_rate=3e-4,
+        n_steps=2048,
+        batch_size=64,          # 2048/64 = 32 minibatches per update
+        n_epochs=10,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.0,           # No exploration bonus needed for Ant
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        target_kl=None,         # or 0.015 for more conservative updates
         policy_kwargs=dict(
             net_arch=dict(pi=[256, 256], vf=[256, 256]),
             activation_fn=torch.nn.ReLU,
