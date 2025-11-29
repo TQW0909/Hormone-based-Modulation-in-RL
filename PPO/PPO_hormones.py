@@ -890,9 +890,15 @@ class HormonePPOCallback(BaseCallback):
             td_bonus = max(0, 1.0 - normalized['td_hat']) * 0.3
             signal_D = signal_D + td_bonus
             
-            
+            # Pulse if signal exceeds threshold and not in refractory
             if self.refrac['D'] == 0 and signal_D > self.th['D']:
-                pulses['D'] = self.k['D'] * signal_D 
+                # Calculate base pulse
+                base_pulse = self.k['D'] * signal_D
+                # Apply saturation factor: reduce pulse when D is already high
+                # This prevents hitting ceiling and allows natural decay
+                # When D is at 1.0, pulse is 0; when D is at 0.5, pulse is full strength
+                saturation_factor = max(0.0, 1.0 - 2.0 * (self.D - 0.5))
+                pulses['D'] = base_pulse * saturation_factor
             else:
                 pulses['D'] = 0.0
         else:
@@ -918,17 +924,17 @@ class HormonePPOCallback(BaseCallback):
         
         # Entropy: exploration (A) increases, exploitation (D) decreases
         # Map from centered hormones (deviation from 0.5) to multiplier
-        ent_multiplier = 1.0 + 0.2 * (A_eff - 0.5) - 0.15 * (D_eff - 0.5)
+        ent_multiplier = 1.0 + 0.2 * (A_eff - 0.5) + 0.15 * (C_eff - 0.5) - 0.15 * (D_eff - 0.5)
         ent = self.ent0 * ent_multiplier
         
         # Learning rate: caution (C) decreases, confidence (D) increases
         # Centered around 0.5: when C=0.5 and D=0.5, multiplier = 1.0
-        lr_multiplier = 1.0 - 0.1 * (C_eff - 0.5) + 0.08 * (D_eff - 0.5)
+        lr_multiplier = 1.0 - 0.05 * (C_eff - 0.5) + 0.08 * (D_eff - 0.5)
         lr = self.lr0 * lr_multiplier
         
         # Clip range: stability (C) tightens, exploration (A) loosens
         # Centered around 0.5: when C=0.5 and A=0.5, multiplier = 1.0
-        clip_multiplier = 1.0 - 0.04 * (C_eff - 0.5) + 0.025 * (A_eff - 0.5)
+        clip_multiplier = 1.0 + 0.025 * (A_eff - 0.5)
         clip = self.clip0 * clip_multiplier
         
         # Apply KL-aware scaling if available
@@ -1058,7 +1064,7 @@ if __name__ == "__main__":
     PROJECT = "hormonal-rl"
     ENV_ID  = "LunarLander-v3"     # "CartPole-v1"  "LunarLander-v3"
     ALGO    = "PPO"
-    VARIANT = "hormones:C_only"
+    VARIANT = "hormones"
     SEED    = 42
     TOTAL_TIMESTEPS = 250_000
     EVAL_FREQ = 10_000
@@ -1094,6 +1100,23 @@ if __name__ == "__main__":
             vf_coef=0.5,
             max_grad_norm=0.5,
             target_kl=None,
+            policy_kwargs=dict(
+                net_arch=dict(pi=[256, 256], vf=[256, 256]),
+                activation_fn=torch.nn.ReLU,
+            )
+        ),
+        "Ant-v4": dict(
+            learning_rate=3e-4,
+            n_steps=2048,
+            batch_size=64,          # 2048/64 = 32 minibatches per update
+            n_epochs=10,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            ent_coef=0.0,           # No exploration bonus needed for Ant
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            target_kl=None,         # or 0.015 for more conservative updates
             policy_kwargs=dict(
                 net_arch=dict(pi=[256, 256], vf=[256, 256]),
                 activation_fn=torch.nn.ReLU,
@@ -1235,9 +1258,9 @@ if __name__ == "__main__":
         # DOPAMINE ONLY - Conservative Settings
         # ========================================
         
-        use_A=False, 
+        use_A=True, 
         use_C=True, 
-        use_D=False,  # Only test Dopamine
+        use_D=True,
         
         # Base hormone levels
         base_A=0.5, 
@@ -1257,7 +1280,7 @@ if __name__ == "__main__":
         warmup_rollouts=20,  # ~80k steps to establish baseline
         
         # Half-life: How fast D decays back to baseline
-        T12_D=15.0,  # 15 rollouts = ~60k steps
+        T12_D=13.0,  # 15 rollouts = ~60k steps
         # Longer half-life = D changes persist longer
         
         # Pulse gain: How much D increases when triggeresd
@@ -1282,11 +1305,11 @@ if __name__ == "__main__":
         # Triggers when (novelty × advantage) > 1.30 baseline
 
         # Half-life: How fast C decays back to baseline
-        T12_C=8.0,  # 20 rollouts = ~80k steps
+        T12_C=14.0,  # 20 rollouts = ~80k steps
         # Longer than A (12.0) and D (15.0) because stress persists longer
         
         # Pulse gain: How much C increases when triggered
-        k_C=0.08,  # Conservative (similar to working D gain)
+        k_C=0.15,  # Conservative (similar to working D gain)
         # Will pulse when volatility (TD error variance) is high
         
         # Threshold: When to trigger C pulse
@@ -1307,7 +1330,7 @@ if __name__ == "__main__":
         # When D low (plateau) → LR decreases (more stable)
 
         # Adrenaline modulates ENTROPY only (exploration)
-        clamp_ent=(0.008, 0.012),   # ±20% around baseline (0.01)
+        clamp_ent=(0.008, 0.015),   # ±20% around baseline (0.01)
         # When A high (novelty) → entropy increases (more exploration)
         # When A low (familiar) → entropy decreases (more exploitation)
         
